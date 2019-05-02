@@ -1,0 +1,107 @@
+# Author: Kedar Kulkarni, Red Hat
+---
+- name: Playbook to deploy a VM on the vCenter
+  hosts: localhost
+  tasks:
+    - name: Include vars file
+      include_vars:
+        file: vm_provisioning_vars.yml
+
+    - name: Create a VM from a template
+      vmware_guest:
+        annotation: Created via Ansible Playbook by KKULKARN@REDHAT.COM
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ validate_certs_flag }}"
+        folder: "{{ vm_folder }}"
+        name: "{{ item.name }}"
+        state: poweredon
+        template: "{{ item.template }}"
+        datacenter: "{{ datacenter_name }}"
+        datastore: iSCSI_Datastore_1
+        disk:
+        - type: thin
+          size_gb: "{{ item.size_gb }}"
+          autoselect_datastore: false
+        hardware:
+          memory_mb: "{{ item.memory_mb }}"
+          num_cpus: "{{ item.num_cpus }}"
+          num_cpu_cores_per_socket: "{{ item.num_cpu_cores_per_socket }}"
+          hotadd_cpu: True
+          hotremove_cpu: True
+          hotadd_memory: True
+        networks:
+        - name: "{{ vm_network_name }}"
+        wait_for_ip_address: "{{ wait_for_ip }}"
+      delegate_to: localhost
+      register: deploy_vm
+      loop: "{{ vms }}"
+
+    - debug:
+        msg: "deployed vm has IP={{ deploy_vm.results[0].instance.ipv4 }}"
+
+    - name: add host to 'just_created' vms groups
+      add_host:
+        hostname: "{{ deploy_vm.results[0].instance.ipv4 }}"
+        group: just_created
+
+    - shell: sshpass -p "some_password" ssh-copy-id -o StrictHostKeyChecking=no root@{{ deploy_vm.results[0].instance.ipv4 }}
+
+- name: Copy repo file to new VM and install minikube
+  hosts: just_created
+  remote_user: root
+  vars:
+    packages:
+      - device-mapper-persistent-data
+      - lvm2
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - kubectl
+  tasks:
+    - name: Copy repos to new vm "{{ ansible_default_ipv4.address }}"
+      copy:
+        src: "{{ item }}"
+        dest: "/etc/yum.repos.d/{{ item }}"
+      with_items:
+        - rhel.repo # you need to have repo file or subscriptions enabled for rhel
+        - docker_ce.repo
+        - kubernetes.repo
+
+    - name: install the container-selinux  rpm from a remote repo
+      yum:
+        name:  http://mirror.centos.org/centos/7/extras/x86_64/Packages/container-selinux-2.74-1.el7.noarch.rpm
+        state: present
+
+    - name: Install required packages
+      package:
+        name: "{{ item }}"
+        state: present
+      with_items: "{{ packages }}"
+
+    - name: Enable service docker, and not touch the state
+      service:
+        name: docker
+        enabled: yes
+        state: started
+
+    - name: Disable service firewalld, and not touch the state
+      service:
+        name: firewalld
+        enabled: yes
+        state: stopped
+
+    - name: Download minikube
+      get_url:
+        url: https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        dest: /usr/local/bin/minikube
+        mode: 0770
+
+    - name: Run minikube command
+      shell: minikube start --vm-driver=none --apiserver-ips "{{ ansible_default_ipv4.address }}" --apiserver-name `hostname`
+
+# run following manually on vm
+# minikube update-context
+# minikube dashboard --url &
+# kubectl proxy --address='0.0.0.0' --disable-filter=true &
